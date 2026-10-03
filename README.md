@@ -1,56 +1,59 @@
 # Softphone call panel
 
-A small React + TypeScript panel driven by the provided mock telephony engine (`src/callEngine.ts`). The engine is **not modified**. Incoming calls, hold/mute, a second waiting call, and messy event delivery (late, duplicated, out of order) are all handled in the state layer.
+A **Next.js** (App Router) + TypeScript panel driven by the provided mock telephony engine (`src/callEngine.ts`). The engine is **not modified**. Incoming calls, hold/mute, a second waiting call, and messy event delivery (late, duplicated, out of order) are handled in the state layer.
 
 ## Run
 
-```bash
+```
 npm install
 npm run dev
 ```
 
-Tests for the reducer:
-
-```bash
-npm test
-```
 
 ## How state is modeled
 
-Each call is its own lifecycle. Mute is a flag on that lifecycle, not a separate phase.
+Each **spawn** is its own lifecycle, keyed by `instanceId`, not by the engine's `callId`. Mute is a flag on that lifecycle, not a separate phase.
 
-| Phase     | Meaning                                      |
-| --------- | -------------------------------------------- |
-| `idle`    | No live calls (panel-level, not a call)      |
-| `incoming`| `INCOMING` / `RINGING`, not answered or ended |
-| `active`  | Answered, not on hold                        |
-| `held`    | Answered and currently held                  |
-| `ended`   | `ENDED` has been applied                     |
+| Phase      | Meaning                                       |
+| ---------- | --------------------------------------------- |
+| `idle`     | No live calls (panel-level, not a call)       |
+| `incoming` | `INCOMING` / `RINGING`, not answered or ended |
+| `active`   | The single talking line                       |
+| `held`     | Answered and not the talking line             |
+| `ended`    | `ENDED` has been applied                      |
 
-**Why fold events per call instead of storing “current phase” on the last packet?** The engine stamps `at` when it *creates* an event, then delivers it later (sometimes twice). Arrival order is not engine order. The UI therefore never trusts wall-clock order.
+Events are stored per instance, sorted by `at`, and folded. Displayed phase always comes from that fold, then **one talking line**: if the engine has two `ANSWERED` calls before `HELD` arrives, only the call the agent last answered or resumed is shown as Active.
 
-For every `callId` we keep the unique events `(type, at)` and **recompute** the view by sorting on `at` and reducing:
+## Exclusive line (one Active call)
 
-1. `INCOMING` / `RINGING` → incoming (caller id can fill in late).
-2. `ANSWERED` → active.
-3. `HELD` / `RESUMED` toggle hold only while the call is still live.
-4. `MUTED` / `UNMUTED` toggle mute independently of hold.
-5. `ENDED` is **sticky**. After it appears in the ordered log, later `ANSWERED` / hold / mute events are ignored so hangup cannot be undone by a slower `answer()` timeout.
+Answer and Resume always `hold()` every other live call that is already Active, or that we have already asked to Answer (two ringing calls). Resume holds the current Active call first. The panel also projects non-talking `active` peers as `held` so the UI cannot show two Active cards while hold events are still in flight.
 
-Displayed state always comes from this fold. Buttons only record an in-flight action so the agent sees “Answering…”; they do not change phase themselves.
+## Reused engine call ids
+
+The mock draws `callId` from ~9,000 values and will eventually reuse them. A new `INCOMING`/`RINGING` for an id that already has a live or ended spawn becomes a new `instanceId`. Late `INCOMING` is still paired with the same spawn when its `at` is before that spawn's `RINGING`. Engine methods still receive the raw `callId`.
 
 ## Out-of-order and duplicates
 
-- **Dedup:** the engine re-fires the *same* event object. Key is `callId + type + at`. A second delivery is a no-op.
-- **Late events:** because we sort by `at` then fold, a RINGING that arrives before INCOMING still becomes incoming with the right number once INCOMING is applied; an ANSWERED with an earlier `at` than ENDED cannot show the call as active.
-- **Action races:** `answer` / `hangup` / hold / mute assign `at` when their timeout fires, not when the agent clicked. Preferring a sticky `ENDED` keeps the panel from resurrecting a call the agent already hung up.
+- **Dedup:** `callId + type + at`. A second delivery of the same object is a no-op.
+- **UI:** the right-hand **Event log** tags those deliveries as **Duplicate ignored** so you can see the call already had that state.
+- **Late events:** sort by `at` then fold. Sticky `ENDED` (`hangup`) so a slower `answer()` timeout cannot resurrect a hung-up call.
 
-Tombstones stay in the board so a duplicate `ENDED` or a late `RINGING` after hangup cannot open a new incoming row for that id.
+Each card shows ringing / talk time **once per second** (not a fast tick). The mock’s spawn schedule is unchanged — we do not edit `callEngine.ts`.
+
+## Typecheck vs `callEngine.ts`
+
+`src/callEngine.ts` uses `Omit<CallEvent, 'at'>` on a union. That type does not keep `from` / `reason`, so **tsc reports 3 errors inside the provided file**. We do not edit it.
+
+- `tsconfig.json` **excludes** `src/callEngine.ts`.
+- TypeScript imports `@engine` from `src/callEngine.d.ts` (hand-written types).
+- Next.js webpack/turbopack alias `@engine` to the real `src/callEngine.ts` at bundle time.
+
+`npm run typecheck` and `npm run build` therefore type-check our code without compiling the engine's broken `emit` helper.
 
 ## Concurrent calls
 
-The engine can spawn a second incoming call while one is live. The panel lists incoming separately from the connected line. **Answer** on a waiting call calls `engine.hold` on the current active call, then `engine.answer` on the waiting one. **Decline** is `engine.hangup` on that waiting id. Hold / resume / mute always target a specific `callId`.
+Incoming is listed separately from the connected line. Decline is `hangup` on that spawn's engine id.
 
 ## Mock engine note
 
-`start()` always schedules `ENDED` with reason `no_answer` several seconds after spawn, even if you already answered. That is engine behavior, not a UI bug: when that event is folded, the call ends.
+`start()` still emits `ENDED` / `no_answer` a few seconds after spawn, even after Answer. The panel **drops** that timeout once you have answered (or clicked Answer), so the call stays on the line. Decline and Hang up still end it.
